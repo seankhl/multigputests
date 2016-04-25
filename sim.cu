@@ -9,39 +9,57 @@
 template <typename T> 
 struct square 
 { 
-	__host__ __device__ T operator()(const T &x) const { return x * x; } 
+    __host__ __device__ T operator()(const T &x) const { return x * x; } 
 };
 
-double dist(Atom a, Atom b)
+float dist(Atom a, Atom b)
 {
-    thrust::device_vector<double> diff(2);
+    thrust::device_vector<float> diff(2);
     thrust::transform(a.begin(), a.end(), b.begin(), b.end(), diff.begin(),
-                      trust::minus<double>());
+                      trust::minus<float>());
     return std::sqrt( thrust::transform_reduce(
-                        diff.begin(), diff.end(), square<double>(),
-                        0, thrust::plus<double>()) ); 
+                        diff.begin(), diff.end(), square<float>(),
+                        0, thrust::plus<float>()) ); 
 }
 */
-__device__ double dist(const double ax, const double ay, 
-					   const double bx, const double by)
+__device__ float dist(const float ax, const float ay, 
+                       const float bx, const float by)
 {
     return sqrt(pow(ax - bx, 2) + pow(ay - by, 2));
 }
 
-__global__ void timestep(const double *atoms_dev, const int atoms_sz, 
-                         const double threshold, const double *vals_old,
-                         double *vals_new, double *dists)
+__global__ void timestep(const int atoms_sz, const float threshold, 
+                         const float4 *vals_old, float4 *vals_new,
+                         const float4 *ghost_lo, const int ghost_lo_sz,
+                         const float4 *ghost_hi, const int ghost_hi_sz)
 {
-    int i = blockIdx.x * 2;
+    int i = blockIdx.x;
     int count = 0;
-    for (int j = 0; j < atoms_sz; j += 2) {
-        dists[blockIdx.x] = dist(atoms_dev[i+0], atoms_dev[i+1], 
-                                 atoms_dev[j+0], atoms_dev[j+1]);
-        if (dists[blockIdx.x] < threshold) {
-            vals_new[blockIdx.x] += vals_old[j/2];
+    vals_new[i].z = 0.0;
+    for (int j = 0; j < atoms_sz; ++j) {
+        vals_new[i].w = dist(vals_old[i].x, vals_old[i].y, 
+                             vals_old[j].x, vals_old[j].y);
+        if (vals_new[i].w < threshold) {
+            vals_new[i].z += vals_old[j].z;
             ++count;
         }
     }
-    vals_new[blockIdx.x] /= count;
+    for (int j = 0; j < ghost_lo_sz; ++j) {
+        vals_new[i].w = dist(vals_old[i].x, vals_old[i].y, 
+                             ghost_lo[j].x, ghost_lo[j].y);
+        if (vals_new[i].w < threshold) {
+            vals_new[i].z += ghost_lo[j].z;
+            ++count;
+        }
+    }
+    for (int j = 0; j < ghost_hi_sz; ++j) {
+        vals_new[i].w = dist(vals_old[i].x, vals_old[i].y, 
+                             ghost_hi[j].x, ghost_hi[j].y);
+        if (vals_new[i].w < threshold) {
+            vals_new[i].z += ghost_hi[j].z;
+            ++count;
+        }
+    }
+    vals_new[i].z /= count;
 }
 

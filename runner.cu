@@ -1,7 +1,7 @@
 
 #include <vector>
-#include <array>
 #include <random>
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <chrono>
@@ -21,11 +21,10 @@ static void HandleError(cudaError_t err,
 }
 #define HANDLE_ERROR( err ) (HandleError( err, __FILE__, __LINE__ ))
 
-const int X_SZ = 1000;
-const int Y_SZ = 1000;
-const int RANGE = 32;
+const int X_SZ = 2048;
+const int Y_SZ = 2048;
+const float RANGE = 32;
 const int natoms = 10000;
-const int natompos = 20000;
 
 int run(int ngpus_in, int nt)
 {
@@ -41,98 +40,206 @@ int run(int ngpus_in, int nt)
     /* Check capability of the GPU 
         (should be done for each card to be used)
     */
-    cudaDeviceProp prop1, prop2;
-
-    // second argument is gpu number
-    cudaGetDeviceProperties(&prop1, 1);
-    cudaGetDeviceProperties(&prop2, 2);
-
-    // check results
+    std::vector<cudaDeviceProp> gpuprops(ngpus);
     bool is_fermi = false;
-    if (prop1.major >= 2 && prop2.major >= 2)  is_fermi = true; // must be Fermi based
+    // second argument is gpu number
+    for (int i = 0; i < ngpus; ++i) {
+        cudaGetDeviceProperties(&gpuprops[i], i + 1);
+    }
+    // check results
+    for (int i = 0; i < ngpus; ++i) {
+        is_fermi &= (gpuprops[i].major >= 2); // must be Fermi based
+    }
     std::cout << "num devices: " << ngpus << "; is fermi? " << is_fermi << std::endl;
-    //return 0;
 
     // random initial values for atoms
     std::random_device rd;
     std::mt19937 mt_rand(rd());
     std::mt19937::result_type x_seed = time(0);
     auto x_rand = std::bind(
-                        std::uniform_real_distribution<double>(0, X_SZ), 
-                        std::mt19937(rd()));
+                        std::uniform_real_distribution<float>(0, X_SZ), 
+                        std::mt19937(1));
     std::mt19937::result_type y_seed = time(0);
     auto y_rand = std::bind(
-                        std::uniform_real_distribution<double>(0, Y_SZ), 
-                        std::mt19937(rd()));
+                        std::uniform_real_distribution<float>(0, Y_SZ), 
+                        std::mt19937(2));
     std::mt19937::result_type val_seed = time(0);
     auto val_rand = std::bind(
-                        std::uniform_real_distribution<double>(0, 1), 
-                        std::mt19937(rd()));
+                        std::uniform_real_distribution<float>(0, 1), 
+                        std::mt19937(3));
 
     // create atoms and store them in the grid
-    std::array<double, natompos> atom_pos;
-    std::array<double, natompos> atom_val;
-    for (int i = 0; i < natompos; i += 2) {
-        atom_pos[i+0] = x_rand();
-        atom_pos[i+1] = y_rand();
-        atom_val[i/2] = val_rand();
+    std::array<float4, natoms> atoms;
+    for (int i = 0; i < natoms; ++i) {
+        atoms[i].x = x_rand();
+        atoms[i].y = y_rand();
+        atoms[i].z = val_rand();
         //grid.record_atom(atoms[atoms.size() - 1]);
     }
-    std::array<double, natoms> dists;
 
-    std::vector<double *> atom_pos_dev(ngpus);
-    std::vector<double *> atom_val_old_dev(ngpus);
-    std::vector<double *> atom_val_new_dev(ngpus);
-    std::vector<double *> dists_dev(ngpus);
-    int atompos_width = natompos / ngpus;
-    int atoms_width = natoms / ngpus;
-    int atompos_off = 0;
+    std::sort(atoms.begin(), atoms.end(), [](float4 a, float4 b) {
+        return a.y < b.y;
+    });
+
     int atoms_off = 0;
+    
+    std::vector<int> cutlo(ngpus, 0);
+    std::vector<int> atoms_split(ngpus, natoms);
+    std::vector<int> atoms_width(ngpus, natoms);
+    std::vector<int> cuthi(ngpus, natoms);
+    for (int i = 0; i < ngpus; ++i) {
+        for (int j = 0; j < natoms; ++j) {
+            if (atoms[j].y > Y_SZ/ngpus * (i+1)) {
+                atoms_split[i] = j;
+                atoms_width[i] = j;
+                break;
+            }
+        }
+    }
+    for (int i = 1; i < ngpus; ++i) {
+        atoms_width[i] -= atoms_width[i-1];
+    }
+    for (int i = 0; i < ngpus; ++i) {
+        for (int j = 0; j < natoms; ++j) {
+            if (atoms[j].y > (Y_SZ/ngpus - RANGE) * (i+1)) {
+                cutlo[i] = j;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < ngpus; ++i) {
+        for (int j = 0; j < natoms; ++j) {
+            if (atoms[j].y > (Y_SZ/ngpus + RANGE) * (i+1)) {
+                cuthi[i] = j;
+                break;
+            }
+        }
+    }
+    for (int i = 0; i < ngpus; ++i) {
+        std::cout << "gpu id: " << i+1 << 
+                     " cutlo: " << cutlo[i] <<
+                     " split: " << atoms_split[i] <<
+                     " cuthi: " << cuthi[i] << std::endl;
+    }
+
+    std::vector<float4 *> atoms_old_dev(ngpus);
+    std::vector<float4 *> atoms_new_dev(ngpus);
     for (int i = 0; i < ngpus; ++i) {
         cudaSetDevice(i + 1);
-        // device positions
-        HANDLE_ERROR( cudaMalloc((void **)&atom_pos_dev[i], 
-                                 atompos_width * sizeof(double)) );
-        HANDLE_ERROR( cudaMemcpy((void *)atom_pos_dev[i], (void *)(atom_pos.data() + atompos_off), 
-                                 atompos_width * sizeof(double), cudaMemcpyHostToDevice) );
         
-        // old vals
-        HANDLE_ERROR( cudaMalloc((void **)&atom_val_old_dev[i], 
-                                 atoms_width * sizeof(double)) );
-        HANDLE_ERROR( cudaMemcpy((void *)atom_val_old_dev[i], (void *)(atom_val.data() + atoms_off), 
-                                 atoms_width * sizeof(double), cudaMemcpyHostToDevice) );
+        // new vals: before timestepping, current vals always in here
+        HANDLE_ERROR( cudaMalloc((void **)&atoms_new_dev[i], 
+                                 atoms_width[i] * sizeof(float4)) );
+        HANDLE_ERROR( cudaMemcpy((void *)atoms_new_dev[i], 
+                                 (void *)(atoms.data() + atoms_off), 
+                                 atoms_width[i] * sizeof(float4), 
+                                 cudaMemcpyHostToDevice) );
         
-        // new vals
-        HANDLE_ERROR( cudaMalloc((void **)&atom_val_new_dev[i], atoms_width * sizeof(double)) );
+        // malloc space for old vals
+        HANDLE_ERROR( cudaMalloc((void **)&atoms_old_dev[i], 
+                                 atoms_width[i] * sizeof(float4)) );
+        HANDLE_ERROR( cudaMemcpy((void *)atoms_old_dev[i], 
+                                 (void *)(atoms.data() + atoms_off), 
+                                 atoms_width[i] * sizeof(float4), 
+                                 cudaMemcpyHostToDevice) );
         
-        // record dists for funsies and debugging
-        HANDLE_ERROR( cudaMalloc((void **)&dists_dev[i], atoms_width * sizeof(double)) );
-
-        atompos_off += atompos_width;
-        atoms_off += atoms_width;
+        
+        atoms_off += atoms_width[i];
+    }
+    
+    std::vector<float4 *> ghost_lo_dev(ngpus-1);
+    std::vector<float4 *> ghost_hi_dev(ngpus-1);
+    for (int i = 0; i < ngpus-1; ++i) {  // don't need last split, always end
+        // ghost vals
+        cudaSetDevice(i + 2);  // next proc gets lo ghosts
+        HANDLE_ERROR( cudaMalloc((void **)&ghost_lo_dev[i], 
+                                 (atoms_split[i] - cutlo[i]) * sizeof(float4)) );
+        HANDLE_ERROR( cudaMemcpy((void *)ghost_lo_dev[i], 
+                                 (void *)(atoms.data() + cutlo[i]), 
+                                 (atoms_split[i] - cutlo[i]) * sizeof(float4), 
+                                 cudaMemcpyHostToDevice) );
+        cudaSetDevice(i + 1);  // this proc gets hi ghosts
+        HANDLE_ERROR( cudaMalloc((void **)&ghost_hi_dev[i], 
+                                 (cuthi[i] - atoms_split[i]) * sizeof(float4)) );
+        HANDLE_ERROR( cudaMemcpy((void *)ghost_hi_dev[i], 
+                                 (void *)(atoms.data() + atoms_split[i]), 
+                                 (cuthi[i] - atoms_split[i]) * sizeof(float4), 
+                                 cudaMemcpyHostToDevice) );
     }
     
     // timestep
     //int x_cell = 0;
     //int y_cell = 0;
     std::cout << "num timesteps: " << nt << std::endl;
-    std::cout << "atom 48: " << atom_pos[48*2+0] << " " 
-                             << atom_pos[48*2+1] << " "
-                             << atom_val[48] << std::endl;
-    for (int i = 0; i < natoms; ++i) {
-        std::cout << atom_val[i] << std::endl;
+    for (int i = 0; i < natoms; i += natoms/10) {
+        std::cout << atoms[i].x << " " << 
+                     atoms[i].y << " " << 
+                     atoms[i].z << std::endl;
     }
 
+    float4 *needs_lo;
+    int needs_lo_sz;
+    float4 *needs_hi;
+    int needs_hi_sz;
+    float4 *atoms_tmp_dev;
     for (int t = 0; t < nt; ++t) {
         for (int i = 0; i < ngpus; ++i) {
             cudaSetDevice(i + 1);
             //if (t % 10000 == 0) { std::cout << t << std::endl; }
-            timestep<<<atoms_width, 1>>>(atom_pos_dev[i], atompos_width, 
-                                    RANGE, atom_val_old_dev[i],
-                                    atom_val_new_dev[i], dists_dev[i]);
-            timestep<<<atoms_width, 1>>>(atom_pos_dev[i], atompos_width, 
-                                    RANGE, atom_val_new_dev[i],
-                                    atom_val_old_dev[i], dists_dev[i]);
+
+            // figure out what our needed ghosts are
+            if (i == 0) {
+                needs_lo = NULL;
+                needs_lo_sz = 0;
+            } else {
+                needs_lo = ghost_lo_dev[i-1];
+                needs_lo_sz = atoms_split[i-1] - cutlo[i-1];
+            }
+            if (i == ngpus-1) {
+                needs_hi = NULL;
+                needs_hi_sz = 0;
+            } else {
+                needs_hi = ghost_hi_dev[i];
+                needs_hi_sz = cuthi[i] - atoms_split[i];
+            }
+            
+            // swap old and new pointers
+            atoms_tmp_dev = atoms_new_dev[i];
+            atoms_new_dev[i] = atoms_old_dev[i];
+            atoms_old_dev[i] = atoms_tmp_dev;
+
+            // run sim
+            timestep<<<atoms_width[i], 1>>>(
+                        atoms_width[i], RANGE, 
+                        atoms_old_dev[i], atoms_new_dev[i],
+                        needs_lo, needs_lo_sz,
+                        needs_hi, needs_hi_sz);
+
+            cudaDeviceSynchronize();
+
+            // update ghosts
+            if (i != 0) {
+                int ghost_lo_sz = atoms_split[i-1] - cutlo[i-1];
+                if (ghost_lo_sz != 0) {  // i != ngpus-1
+                    HANDLE_ERROR( 
+                        cudaMemcpy(
+                            (void *)ghost_lo_dev[i-1], 
+                            (void *)(atoms_new_dev[i-1] + 
+                                        (atoms_width[i-1] - ghost_lo_sz)), 
+                            ghost_lo_sz * sizeof(float4), 
+                            cudaMemcpyDeviceToDevice) );
+                }
+                int ghost_hi_sz = cuthi[i-1] - atoms_split[i-1];
+                if (cuthi[i-1] - atoms_split[i-1] != 0) {  // i != 0
+                    HANDLE_ERROR( 
+                        cudaMemcpy(
+                            (void *)ghost_hi_dev[i-1], 
+                            (void *)(atoms_new_dev[i]), 
+                            ghost_hi_sz * sizeof(float4), 
+                            cudaMemcpyDeviceToDevice) );
+                }
+            }
+
         }
         /*
         for (auto atom: atoms) {
@@ -146,34 +253,35 @@ int run(int ngpus_in, int nt)
                         neighbors
         */
     }
+    /*
+            timestep<<<atoms_width[i], 1>>>(
+                        atoms_width[i], RANGE, 
+                        atoms_new_dev[i], atoms_old_dev[i],
+                        ghost_lo_dev[i], atoms_split[i] - cutlo[i],
+                        ghost_hi_dev[i], cuthi[i] - atoms_split[i]);
+    */
 
-    atompos_off = 0;
     atoms_off = 0;
     for (int i = 0; i < ngpus; ++i) {
         cudaSetDevice(i + 1);
-        HANDLE_ERROR( cudaMemcpy((void *)(atom_pos.data() + atompos_off), (void *)atom_pos_dev[i], 
-                      atompos_width * sizeof(double), cudaMemcpyDeviceToHost) );
-        HANDLE_ERROR( cudaMemcpy((void *)(atom_val.data() + atoms_off), (void *)atom_val_new_dev[i], 
-                      atoms_width * sizeof(double), cudaMemcpyDeviceToHost) );
-        HANDLE_ERROR( cudaMemcpy((void *)(dists.data() + atoms_off), (void *)dists_dev[i], 
-                      atoms_width * sizeof(double), cudaMemcpyDeviceToHost) );
-        atompos_off += atompos_width;
-        atoms_off += atoms_width;
-    }
-
-    std::cout << "atom 48: " << atom_pos[48*2+0] << " " 
-                             << atom_pos[48*2+1] << " "
-                             << atom_val[48] << " "
-                             << dists[48] << std::endl;
-    for (int i = 0; i < natoms; ++i) {
-        std::cout << dists[i] << std::endl;
+        HANDLE_ERROR( cudaMemcpy((void *)(atoms.data() + atoms_off), 
+                                 (void *)atoms_new_dev[i], 
+                                 atoms_width[i] * sizeof(float4), 
+                                 cudaMemcpyDeviceToHost) );
+        atoms_off += atoms_width[i];
     }
     
+    std::cout << "results: " << std::endl;
+    for (int i = 0; i < natoms; i += natoms/10) {
+        std::cout << atoms[i].x << " " << 
+                     atoms[i].y << " " << 
+                     atoms[i].z << " " <<
+                     atoms[i].w << std::endl;
+    }
+
     for (int i = 0; i < ngpus; ++i) {
-        cudaFree((void *)atom_pos_dev[i]);
-        cudaFree((void *)atom_val_old_dev[i]);
-        cudaFree((void *)atom_val_new_dev[i]);
-        cudaFree((void *)dists_dev[i]);
+        cudaFree((void *)atoms_old_dev[i]);
+        cudaFree((void *)atoms_new_dev[i]);
     }
 
     return 0;
@@ -181,16 +289,16 @@ int run(int ngpus_in, int nt)
 }
 
 int main() {
-    std::chrono::time_point<std::chrono::system_clock> one_start, one_end;
-    one_start = std::chrono::system_clock::now();
-    run(1, 1);
-    one_end = std::chrono::system_clock::now();
+    std::chrono::time_point<std::chrono::steady_clock> one_start, one_end;
+    one_start = std::chrono::steady_clock::now();
+    run(2, 10);
+    one_end = std::chrono::steady_clock::now();
     std::chrono::duration<double> one_dur = one_end - one_start;
     
-    std::chrono::time_point<std::chrono::system_clock> two_start, two_end;
-    two_start = std::chrono::system_clock::now();
-    run(2, 1);
-    two_end = std::chrono::system_clock::now();
+    std::chrono::time_point<std::chrono::steady_clock> two_start, two_end;
+    two_start = std::chrono::steady_clock::now();
+    run(1, 10);
+    two_end = std::chrono::steady_clock::now();
     std::chrono::duration<double> two_dur = two_end - two_start;
     
     std::cout << "one took: " << one_dur.count() << " seconds; " << std::endl;
