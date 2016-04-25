@@ -26,7 +26,7 @@ static void HandleError(cudaError_t err,
 const int X_SZ = 2048;
 const int Y_SZ = 2048;
 const float RANGE = 32;
-const int natoms = 1000;
+const int natoms = 10000;
 
 /* Check capability of the GPU (should be done for each card to be used) */
 void printDeviceCheck()
@@ -35,7 +35,6 @@ void printDeviceCheck()
     cudaGetDeviceCount(&ngpus);
     
     std::vector<cudaDeviceProp> gpuprops(ngpus);
-    // second argument is gpu number
     for (int i = 0; i < ngpus; ++i) {
         cudaGetDeviceProperties(&gpuprops[i], i);
     }
@@ -86,11 +85,6 @@ void MPI_Sendrecv_gpulocal(
 {
     int mpi_rank;
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
-    /*
-    MPI_Sendrecv(sendbuf, count, type, mpi_rank, 0,
-                 recvbuf, count, type, mpi_rank, MPI_ANY_TAG,
-                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    */
     MPI_Request requests[2];
     MPI_Status statuses[2];
     MPI_Isend(sendbuf, count, type, mpi_rank, 0,
@@ -102,10 +96,6 @@ void MPI_Sendrecv_gpulocal(
 
 int run(int ngpus_in, int nt)
 {
-    //constexpr int X_NBINS = X_SZ / RANGE + 1;
-    //constexpr int Y_NBINS = Y_SZ / RANGE + 1;
-    //Grid grid = new Grid(X_NBINS, Y_NBINS);
-
     int ngpus;
     cudaGetDeviceCount(&ngpus);
     if (ngpus_in < ngpus) { ngpus = ngpus_in; }
@@ -201,6 +191,7 @@ int run(int ngpus_in, int nt)
                                  atoms_width[i] * sizeof(float4), 
                                  cudaMemcpyHostToDevice) );
         
+        // TODO: already have splits now...
         atoms_off += atoms_width[i];
     }
     
@@ -225,8 +216,6 @@ int run(int ngpus_in, int nt)
     }
     
     // timestep
-    //int x_cell = 0;
-    //int y_cell = 0;
     std::cout << "num timesteps: " << nt << std::endl;
     for (int i = 0; i < natoms; i += natoms/10) {
         std::cout << atoms[i].x << " " << 
@@ -278,64 +267,25 @@ int run(int ngpus_in, int nt)
             if (i != 0) {
                 int ghost_lo_sz = atoms_split[i-1] - cutlo[i-1];
                 if (ghost_lo_sz != 0) {  // i != ngpus-1
-                    /*
-                    HANDLE_ERROR( 
-                        cuMemcpyAsync(
-                            (void *)ghost_lo_dev[i-1], 
-                            (void *)(atoms_new_dev[i-1] + 
-                                        (atoms_width[i-1] - ghost_lo_sz)), 
-                            ghost_lo_sz * sizeof(float4), 
-                            0) );
-                    */
-                    /*
-                    HANDLE_ERROR( 
-                        cudaMemcpy(
-                            (void *)ghost_lo_dev[i-1], 
-                            (void *)(atoms_new_dev[i-1] + 
-                                        (atoms_width[i-1] - ghost_lo_sz)), 
-                            ghost_lo_sz * sizeof(float4), 
-                            cudaMemcpyDeviceToDevice) );
-                    */
-                    
                     MPI_Sendrecv_gpulocal(
                             (void *)(atoms_new_dev[i-1] +
                                         (atoms_width[i-1] - ghost_lo_sz)), 
                             (void *)ghost_lo_dev[i-1],
-                            ghost_lo_sz * sizeof(float4),
+                            ghost_lo_sz * sizeof(float4)/sizeof(float),
                             MPI_FLOAT);
-                    
                 }
                 int ghost_hi_sz = cuthi[i-1] - atoms_split[i-1];
                 if (cuthi[i-1] - atoms_split[i-1] != 0) {  // i != 0
-                    HANDLE_ERROR( 
-                        cudaMemcpy(
+                    MPI_Sendrecv_gpulocal(
                             (void *)ghost_hi_dev[i-1], 
                             (void *)(atoms_new_dev[i]), 
-                            ghost_hi_sz * sizeof(float4), 
-                            cudaMemcpyDeviceToDevice) );
+                            ghost_hi_sz * sizeof(float4)/sizeof(float),
+                            MPI_FLOAT);
                 }
             }
 
         }
-        /*
-        for (auto atom: atoms) {
-            grid.get_cell_by_atom(atom, x_cell, y_cell);
-            for (int x_off = -1; x_off <= 1; ++x_off) {
-                for (int y_off = -1; y_off <= 1; ++y_off) {
-                    vector<int> neighbors = grid.get_atoms_in_cell(
-                                                x_cell + x_off, 
-                                                y_cell + y_off);
-                    if (x_off != 0 && y_off != 0) {
-                        neighbors
-        */
     }
-    /*
-            timestep<<<atoms_width[i], 1>>>(
-                        atoms_width[i], RANGE, 
-                        atoms_new_dev[i], atoms_old_dev[i],
-                        ghost_lo_dev[i], atoms_split[i] - cutlo[i],
-                        ghost_hi_dev[i], cuthi[i] - atoms_split[i]);
-    */
 
     atoms_off = 0;
     for (int i = 0; i < ngpus; ++i) {

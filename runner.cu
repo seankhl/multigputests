@@ -24,7 +24,7 @@ static void HandleError(cudaError_t err,
 const int X_SZ = 2048;
 const int Y_SZ = 2048;
 const float RANGE = 32;
-const int natoms = 1000;
+const int natoms = 10000;
 
 /* Check capability of the GPU (should be done for each card to be used) */
 void printDeviceCheck()
