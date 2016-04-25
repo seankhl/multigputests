@@ -8,6 +8,12 @@ parallelism. There is a GPUDirect version (native CUDA) and an MPI version
 thrust/nccl in the future. We could also look at a native CUDA version that
 uses remote memory access instead of GPU<->GPU communications.
 
+To run the mpi code, execute the following command:
+
+```bash
+/usr/local/mpi-cuda/bin/mpirun -np 1 --mca btl openib,self mpi_test 
+```
+
 Helpful Links
 =============
 
